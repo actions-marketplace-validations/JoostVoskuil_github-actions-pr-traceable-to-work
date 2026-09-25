@@ -12,8 +12,23 @@ const DOCS_URL =
 
 interface LinkedIssue {
   number: number;
-  repository_url?: string;
-  url?: string;
+  repository?: {
+    nameWithOwner: string;
+  };
+}
+
+interface ClosingIssuesResponse {
+  repository: {
+    pullRequest: {
+      closingIssuesReferences: {
+        nodes: Array<LinkedIssue | null>;
+        pageInfo: {
+          hasNextPage: boolean;
+          endCursor: string | null;
+        };
+      };
+    };
+  };
 }
 
 function isLinkedIssue(value: unknown): value is LinkedIssue {
@@ -21,7 +36,12 @@ function isLinkedIssue(value: unknown): value is LinkedIssue {
     typeof value === 'object' &&
     value !== null &&
     'number' in value &&
-    typeof value.number === 'number'
+    typeof value.number === 'number' &&
+    'repository' in value &&
+    typeof value.repository === 'object' &&
+    value.repository !== null &&
+    'nameWithOwner' in value.repository &&
+    typeof value.repository.nameWithOwner === 'string'
   );
 }
 
@@ -30,12 +50,9 @@ function belongsToRepository(
   owner: string,
   repo: string,
 ): boolean {
-  const repositoryPath = `/repos/${owner}/${repo}`.toLowerCase();
-  const issueUrl = issue.repository_url ?? issue.url ?? '';
-  const normalizedUrl = issueUrl.toLowerCase();
   return (
-    normalizedUrl.endsWith(repositoryPath) ||
-    normalizedUrl.includes(`${repositoryPath}/issues/`)
+    issue.repository?.nameWithOwner.toLowerCase() ===
+    `${owner}/${repo}`.toLowerCase()
   );
 }
 
@@ -71,20 +88,41 @@ export const githubIssuesProvider: WorkItemProvider = {
     pullRequest: PullRequestContext,
     reference: WorkItemReference,
   ) {
-    for (let page = 1; ; page += 1) {
-      const response = await octokit.request(
-        'GET /repos/{owner}/{repo}/pulls/{pull_number}/issues',
-        {
-          owner: pullRequest.owner,
-          repo: pullRequest.repo,
-          pull_number: pullRequest.number,
-          per_page: 100,
-          page,
-        },
-      );
-      const linkedIssues = Array.isArray(response.data)
-        ? response.data.filter(isLinkedIssue)
-        : [];
+    let cursor: string | null = null;
+
+    do {
+      const response: ClosingIssuesResponse =
+        await octokit.graphql<ClosingIssuesResponse>(
+          `
+          query($owner: String!, $repo: String!, $pullNumber: Int!, $after: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pullNumber) {
+                closingIssuesReferences(first: 100, after: $after) {
+                  nodes {
+                    number
+                    repository {
+                      nameWithOwner
+                    }
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          }
+          `,
+          {
+            owner: pullRequest.owner,
+            repo: pullRequest.repo,
+            pullNumber: pullRequest.number,
+            after: cursor,
+          },
+        );
+      const connection: ClosingIssuesResponse['repository']['pullRequest']['closingIssuesReferences'] =
+        response.repository.pullRequest.closingIssuesReferences;
+      const linkedIssues = connection.nodes.filter(isLinkedIssue);
 
       if (
         linkedIssues.some(
@@ -96,16 +134,17 @@ export const githubIssuesProvider: WorkItemProvider = {
         return true;
       }
 
-      if (linkedIssues.length < 100) {
-        return false;
-      }
-    }
+      cursor = connection.pageInfo.endCursor;
+      if (!connection.pageInfo.hasNextPage) return false;
+    } while (cursor);
+
+    return false;
   },
   getMissingMessage() {
-    return 'Description does not contain a GitHub closing issue reference, such as Fixes #123';
+    return 'Description does not contain a GitHub issue reference, such as Fixes #123';
   },
   getUnlinkedMessage(reference: WorkItemReference) {
-    return `Description references ${reference.display}, but GitHub has not linked that issue to this pull request`;
+    return `Description contains ${reference.display}, but GitHub has not linked that issue`;
   },
   getSuccessMessage(reference: WorkItemReference) {
     return `Work item link check complete. GitHub issue ${reference.display} is linked to this pull request.`;

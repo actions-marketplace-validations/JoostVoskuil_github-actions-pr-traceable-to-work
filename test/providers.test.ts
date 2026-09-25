@@ -14,13 +14,30 @@ const pullRequest: PullRequestContext = {
 };
 
 function createOctokit(pages: unknown[][]): Octokit {
-  const request = vi.fn(
-    async (_route: string, parameters: { page: number }) => ({
-      data: pages[parameters.page - 1] ?? [],
-    }),
+  const request = vi.fn(async () => ({ data: [] }));
+  const graphql = vi.fn(
+    async (_query: string, parameters: { after: string | null }) => {
+      const page = parameters.after
+        ? Number(parameters.after.replace('cursor-', '')) + 1
+        : 1;
+      const nodes = pages[page - 1] ?? [];
+      return {
+        repository: {
+          pullRequest: {
+            closingIssuesReferences: {
+              nodes,
+              pageInfo: {
+                hasNextPage: page < pages.length,
+                endCursor: page < pages.length ? `cursor-${page}` : null,
+              },
+            },
+          },
+        },
+      };
+    },
   );
 
-  return { request } as unknown as Octokit;
+  return { request, graphql } as unknown as Octokit;
 }
 
 describe('Azure DevOps provider', () => {
@@ -35,6 +52,38 @@ describe('Azure DevOps provider', () => {
     });
   });
 
+  test('finds an AB work item reference after a closing keyword', () => {
+    expect(
+      azureDevOpsProvider.findReference('Closes AB#2469', pullRequest),
+    ).toMatchObject({
+      id: '2469',
+      display: 'AB#2469',
+      owner: 'octo-org',
+      repo: 'project',
+    });
+  });
+
+  test('finds an AB work item reference inside a Markdown link', () => {
+    expect(
+      azureDevOpsProvider.findReference(
+        'Closes [AB#2659](https://dev.azure.com/example/_workitems/edit/2659)',
+        pullRequest,
+      ),
+    ).toMatchObject({
+      id: '2659',
+      display: 'AB#2659',
+    });
+  });
+
+  test('accepts a lowercase AB reference', () => {
+    expect(
+      azureDevOpsProvider.findReference('Closes ab#2469', pullRequest),
+    ).toMatchObject({
+      id: '2469',
+      display: 'AB#2469',
+    });
+  });
+
   test('requires Azure Boards rendered link evidence', async () => {
     const reference = azureDevOpsProvider.findReference(
       'Implements AB#123',
@@ -45,6 +94,25 @@ describe('Azure DevOps provider', () => {
     await expect(
       azureDevOpsProvider.isLinked(createOctokit([]), pullRequest, reference),
     ).resolves.toBe(false);
+  });
+
+  test('uses consistent Azure DevOps work item messages', () => {
+    const reference = azureDevOpsProvider.findReference(
+      'Implements AB#123',
+      pullRequest,
+    );
+
+    expect(azureDevOpsProvider.getMissingMessage()).toBe(
+      'Description does not contain an Azure DevOps work item reference, such as AB#123',
+    );
+    expect(reference).toBeDefined();
+    if (!reference) throw new Error('Expected an Azure DevOps reference');
+    expect(azureDevOpsProvider.getUnlinkedMessage(reference)).toBe(
+      'Description contains AB#123, but Azure DevOps has not linked that work item',
+    );
+    expect(azureDevOpsProvider.getSuccessMessage(reference)).toBe(
+      'Work item link check complete. Azure DevOps work item AB#123 is linked to this pull request.',
+    );
   });
 });
 
@@ -58,6 +126,25 @@ describe('GitHub Issues provider', () => {
       owner: 'octo-org',
       repo: 'project',
     });
+  });
+
+  test('uses consistent GitHub issue messages', () => {
+    const reference = githubIssuesProvider.findReference(
+      'Fixes #123',
+      pullRequest,
+    );
+
+    expect(githubIssuesProvider.getMissingMessage()).toBe(
+      'Description does not contain a GitHub issue reference, such as Fixes #123',
+    );
+    expect(reference).toBeDefined();
+    if (!reference) throw new Error('Expected a GitHub issue reference');
+    expect(githubIssuesProvider.getUnlinkedMessage(reference)).toBe(
+      'Description contains octo-org/project#123, but GitHub has not linked that issue',
+    );
+    expect(githubIssuesProvider.getSuccessMessage(reference)).toBe(
+      'Work item link check complete. GitHub issue octo-org/project#123 is linked to this pull request.',
+    );
   });
 
   test('recognizes closing keywords without regard to case', () => {
@@ -98,7 +185,7 @@ describe('GitHub Issues provider', () => {
       [
         {
           number: 123,
-          repository_url: 'https://api.github.com/repos/octo-org/project',
+          repository: { nameWithOwner: 'octo-org/project' },
         },
       ],
     ]);
@@ -118,7 +205,7 @@ describe('GitHub Issues provider', () => {
       [
         {
           number: 123,
-          repository_url: 'https://api.github.com/repos/octo-org/project',
+          repository: { nameWithOwner: 'octo-org/project' },
         },
       ],
     ]);
@@ -136,14 +223,14 @@ describe('GitHub Issues provider', () => {
     );
     const firstPage = Array.from({ length: 100 }, (_, index) => ({
       number: index + 1000,
-      repository_url: 'https://api.github.com/repos/octo-org/project',
+      repository: { nameWithOwner: 'octo-org/project' },
     }));
     const octokit = createOctokit([
       firstPage,
       [
         {
           number: 123,
-          repository_url: 'https://api.github.com/repos/octo-org/project',
+          repository: { nameWithOwner: 'octo-org/project' },
         },
       ],
     ]);
@@ -152,5 +239,22 @@ describe('GitHub Issues provider', () => {
     await expect(
       githubIssuesProvider.isLinked(octokit, pullRequest, reference),
     ).resolves.toBe(true);
+  });
+
+  test('returns false when an issue is absent from all linked-issue pages', async () => {
+    const reference = githubIssuesProvider.findReference(
+      'Fixes #999',
+      pullRequest,
+    );
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      number: index + 1000,
+      repository: { nameWithOwner: 'octo-org/project' },
+    }));
+    const octokit = createOctokit([firstPage, []]);
+
+    if (!reference) throw new Error('Expected a GitHub issue reference');
+    await expect(
+      githubIssuesProvider.isLinked(octokit, pullRequest, reference),
+    ).resolves.toBe(false);
   });
 });

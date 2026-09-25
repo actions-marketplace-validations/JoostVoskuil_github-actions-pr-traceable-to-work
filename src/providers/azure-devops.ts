@@ -5,7 +5,7 @@ import type {
   WorkItemReference,
 } from './types';
 
-const AB_PATTERN = /AB#(\d+)/g;
+const AB_PATTERN = /\bAB#(\d+)\b/i;
 const AZURE_BOARDS_BOT = 'azure-boards[bot]';
 const DOCS_URL =
   'https://learn.microsoft.com/en-us/azure/devops/boards/github/link-to-from-github?view=azure-devops#use-ab-mention-to-link-from-github-to-azure-boards-work-items';
@@ -19,13 +19,13 @@ export const azureDevOpsProvider: WorkItemProvider = {
   },
   docsUrl: DOCS_URL,
   findReference(description: string, pullRequest: PullRequestContext) {
-    const match = description.match(AB_PATTERN)?.[0];
+    const match = AB_PATTERN.exec(description);
 
     if (!match) {
       return undefined;
     }
 
-    const id = match.substring(3);
+    const id = match[1];
     return {
       id,
       owner: pullRequest.owner,
@@ -44,13 +44,13 @@ export const azureDevOpsProvider: WorkItemProvider = {
     );
   },
   getMissingMessage() {
-    return 'Description does not contain AB#{ID}';
+    return 'Description does not contain an Azure DevOps work item reference, such as AB#123';
   },
   getUnlinkedMessage(reference: WorkItemReference) {
-    return `Description contains ${reference.display} but the Bot could not link it to an Azure Boards work item`;
+    return `Description contains ${reference.display}, but Azure DevOps has not linked that work item`;
   },
   getSuccessMessage(reference: WorkItemReference) {
-    return `Work item link check complete. Description contains link ${reference.display} to an Azure Boards work item.`;
+    return `Work item link check complete. Azure DevOps work item ${reference.display} is linked to this pull request.`;
   },
   shouldWaitForLink(senderLogin: string) {
     return senderLogin === AZURE_BOARDS_BOT;

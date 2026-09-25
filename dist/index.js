@@ -37161,7 +37161,7 @@ function getOctokit(token, options, ...additionalPlugins) {
 }
 //# sourceMappingURL=github.js.map
 ;// CONCATENATED MODULE: ./lib/providers/azure-devops.js
-const AB_PATTERN = /AB#(\d+)/g;
+const AB_PATTERN = /\bAB#(\d+)\b/i;
 const AZURE_BOARDS_BOT = 'azure-boards[bot]';
 const DOCS_URL = 'https://learn.microsoft.com/en-us/azure/devops/boards/github/link-to-from-github?view=azure-devops#use-ab-mention-to-link-from-github-to-azure-boards-work-items';
 const azureDevOpsProvider = {
@@ -37173,11 +37173,11 @@ const azureDevOpsProvider = {
     },
     docsUrl: DOCS_URL,
     findReference(description, pullRequest) {
-        const match = description.match(AB_PATTERN)?.[0];
+        const match = AB_PATTERN.exec(description);
         if (!match) {
             return undefined;
         }
-        const id = match.substring(3);
+        const id = match[1];
         return {
             id,
             owner: pullRequest.owner,
@@ -37190,13 +37190,13 @@ const azureDevOpsProvider = {
             pullRequest.description.includes('/_workitems/edit/'));
     },
     getMissingMessage() {
-        return 'Description does not contain AB#{ID}';
+        return 'Description does not contain an Azure DevOps work item reference, such as AB#123';
     },
     getUnlinkedMessage(reference) {
-        return `Description contains ${reference.display} but the Bot could not link it to an Azure Boards work item`;
+        return `Description contains ${reference.display}, but Azure DevOps has not linked that work item`;
     },
     getSuccessMessage(reference) {
-        return `Work item link check complete. Description contains link ${reference.display} to an Azure Boards work item.`;
+        return `Work item link check complete. Azure DevOps work item ${reference.display} is linked to this pull request.`;
     },
     shouldWaitForLink(senderLogin) {
         return senderLogin === AZURE_BOARDS_BOT;
@@ -37213,14 +37213,16 @@ function isLinkedIssue(value) {
     return (typeof value === 'object' &&
         value !== null &&
         'number' in value &&
-        typeof value.number === 'number');
+        typeof value.number === 'number' &&
+        'repository' in value &&
+        typeof value.repository === 'object' &&
+        value.repository !== null &&
+        'nameWithOwner' in value.repository &&
+        typeof value.repository.nameWithOwner === 'string');
 }
 function belongsToRepository(issue, owner, repo) {
-    const repositoryPath = `/repos/${owner}/${repo}`.toLowerCase();
-    const issueUrl = issue.repository_url ?? issue.url ?? '';
-    const normalizedUrl = issueUrl.toLowerCase();
-    return (normalizedUrl.endsWith(repositoryPath) ||
-        normalizedUrl.includes(`${repositoryPath}/issues/`));
+    return (issue.repository?.nameWithOwner.toLowerCase() ===
+        `${owner}/${repo}`.toLowerCase());
 }
 const githubIssuesProvider = {
     name: 'github',
@@ -37247,31 +37249,50 @@ const githubIssuesProvider = {
         };
     },
     async isLinked(octokit, pullRequest, reference) {
-        for (let page = 1;; page += 1) {
-            const response = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/issues', {
+        let cursor = null;
+        do {
+            const response = await octokit.graphql(`
+          query($owner: String!, $repo: String!, $pullNumber: Int!, $after: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pullNumber) {
+                closingIssuesReferences(first: 100, after: $after) {
+                  nodes {
+                    number
+                    repository {
+                      nameWithOwner
+                    }
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          }
+          `, {
                 owner: pullRequest.owner,
                 repo: pullRequest.repo,
-                pull_number: pullRequest.number,
-                per_page: 100,
-                page,
+                pullNumber: pullRequest.number,
+                after: cursor,
             });
-            const linkedIssues = Array.isArray(response.data)
-                ? response.data.filter(isLinkedIssue)
-                : [];
+            const connection = response.repository.pullRequest.closingIssuesReferences;
+            const linkedIssues = connection.nodes.filter(isLinkedIssue);
             if (linkedIssues.some((issue) => issue.number === Number(reference.id) &&
                 belongsToRepository(issue, reference.owner, reference.repo))) {
                 return true;
             }
-            if (linkedIssues.length < 100) {
+            cursor = connection.pageInfo.endCursor;
+            if (!connection.pageInfo.hasNextPage)
                 return false;
-            }
-        }
+        } while (cursor);
+        return false;
     },
     getMissingMessage() {
-        return 'Description does not contain a GitHub closing issue reference, such as Fixes #123';
+        return 'Description does not contain a GitHub issue reference, such as Fixes #123';
     },
     getUnlinkedMessage(reference) {
-        return `Description references ${reference.display}, but GitHub has not linked that issue to this pull request`;
+        return `Description contains ${reference.display}, but GitHub has not linked that issue`;
     },
     getSuccessMessage(reference) {
         return `Work item link check complete. GitHub issue ${reference.display} is linked to this pull request.`;
